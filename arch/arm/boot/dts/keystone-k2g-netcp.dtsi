@@ -120,8 +120,24 @@ netcp: netcp@4000000 {
 
 	dma-coherent;
 
-	ti,navigator-dmas = <&dma_gbe 0>, <&dma_gbe 5>;
-	ti,navigator-dma-names = "netrx0", "nettx";
+	ti,navigator-dmas = <&dma_gbe 0>,
+			    <&dma_gbe 5>,
+			    <&dma_gbe 6>,
+			    <&dma_gbe 7>,
+			    <&dma_gbe 8>,
+			    <&dma_gbe 9>,
+			    <&dma_gbe 10>,
+			    <&dma_gbe 11>,
+			    <&dma_gbe 12>;
+	ti,navigator-dma-names = "netrx0",
+				 "nettx0",
+				 "nettx1",
+				 "nettx2",
+				 "nettx3",
+				 "nettx4",
+				 "nettx5",
+				 "nettx6",
+				 "nettx7";
 
 	netcp-devices {
 		#address-cells = <1>;
@@ -133,8 +149,15 @@ netcp: netcp@4000000 {
 			syscon-subsys = <&gbe_subsys>;
 			reg = <0x200100 0xe00>, <0x220000 0x20000>;
 			enable-ale;
-			tx-queue = <5>;
-			tx-channel = "nettx";
+			tx-queue = <5 6 7 8 9 10 11 12>;
+			tx-channel = "nettx0",
+				     "nettx1",
+				     "nettx2",
+				     "nettx3",
+				     "nettx4",
+				     "nettx5",
+				     "nettx6",
+				     "nettx7";
 			cpts-rftclk-sel = <0>;
 			cpts-ext-ts-inputs = <8>;
 
