@@ -77,6 +77,7 @@ int knav_queue_push(void *qhandle, dma_addr_t dma,
 
 void *knav_pool_create(const char *name,
 				int num_desc, int region_id);
+const char *knav_get_pool_name(void *ph);
 void knav_pool_destroy(void *ph);
 int knav_pool_count(void *ph);
 void *knav_pool_desc_get(void *ph);

@@ -887,10 +887,11 @@ static void netcp_rx_notify(void *arg)
 	napi_schedule(&netcp->rx_napi);
 }
 
-static void netcp_free_tx_desc_chain(struct netcp_intf *netcp,
+static void netcp_free_tx_desc_chain(struct netcp_channel *ch,
 				     struct knav_dma_desc *desc,
 				     unsigned int desc_sz)
 {
+	struct netcp_intf *netcp = ch->netcp;
 	struct knav_dma_desc *ndesc = desc;
 	dma_addr_t dma_desc, dma_buf;
 	unsigned int buf_len;
@@ -905,10 +906,10 @@ static void netcp_free_tx_desc_chain(struct netcp_intf *netcp,
 			dev_warn(netcp->ndev_dev, "bad Tx desc buf(%pad), len(%d)\n",
 				 &dma_buf, buf_len);
 
-		knav_pool_desc_put(netcp->tx_pool, ndesc);
+		knav_pool_desc_put(ch->pool, ndesc);
 		ndesc = NULL;
 		if (dma_desc) {
-			ndesc = knav_pool_desc_unmap(netcp->tx_pool, dma_desc,
+			ndesc = knav_pool_desc_unmap(ch->pool, dma_desc,
 						     desc_sz);
 			if (!ndesc)
 				dev_err(netcp->ndev_dev, "failed to unmap Tx desc\n");
@@ -919,19 +920,24 @@ static void netcp_free_tx_desc_chain(struct netcp_intf *netcp,
 static int netcp_process_tx_compl_packets(struct netcp_intf *netcp,
 					  unsigned int budget)
 {
-	struct netcp_stats *tx_stats = &netcp->stats;
+	struct netcp_channel *ch = netcp->tx_ch;
+	struct netcp_stats *tx_stats;
 	struct knav_dma_desc *desc;
 	struct netcp_tx_cb *tx_cb;
 	struct sk_buff *skb;
 	unsigned int dma_sz;
 	dma_addr_t dma;
 	int pkts = 0;
+	int idx;
 
+	tx_stats = &netcp->stats;
 	while (budget--) {
 		dma = knav_queue_pop(netcp->tx_compl_q, &dma_sz);
 		if (!dma)
 			break;
-		desc = knav_pool_desc_unmap(netcp->tx_pool, dma, dma_sz);
+
+		/* unmap using tx pool 0, all tx pools have the same region */
+		desc = knav_pool_desc_unmap(ch->pool, dma, dma_sz);
 		if (unlikely(!desc)) {
 			dev_err(netcp->ndev_dev, "failed to unmap Tx desc\n");
 			tx_stats->tx_errors++;
@@ -942,7 +948,8 @@ static int netcp_process_tx_compl_packets(struct netcp_intf *netcp,
 		 * field as a 32bit value. Will not work on 64bit machines
 		 */
 		skb = (struct sk_buff *)KNAV_DMA_GET_SW_DATA0(desc);
-		netcp_free_tx_desc_chain(netcp, desc, dma_sz);
+		idx = skb_get_queue_mapping(skb);
+		netcp_free_tx_desc_chain(&ch[idx], desc, dma_sz);
 		if (!skb) {
 			dev_err(netcp->ndev_dev, "No skb in Tx desc\n");
 			tx_stats->tx_errors++;
@@ -955,12 +962,9 @@ static int netcp_process_tx_compl_packets(struct netcp_intf *netcp,
 
 		if (netif_subqueue_stopped(netcp->ndev, skb) &&
 		    netif_running(netcp->ndev) &&
-		    (knav_pool_count(netcp->tx_pool) >
-		    netcp->tx_resume_threshold)) {
-			u16 subqueue = skb_get_queue_mapping(skb);
-
-			netif_wake_subqueue(netcp->ndev, subqueue);
-		}
+		    (knav_pool_count(ch[idx].pool) >
+		    netcp->tx_resume_threshold))
+			netif_wake_subqueue(netcp->ndev, idx);
 
 		u64_stats_update_begin(&tx_stats->syncp_tx);
 		tx_stats->tx_packets++;
@@ -996,11 +1000,13 @@ static void netcp_tx_notify(void *arg)
 }
 
 static struct knav_dma_desc*
-netcp_tx_map_skb(struct sk_buff *skb, struct netcp_intf *netcp)
+netcp_tx_map_skb(struct sk_buff *skb, struct netcp_channel *ch)
 {
 	struct knav_dma_desc *desc, *ndesc, *pdesc;
 	unsigned int pkt_len = skb_headlen(skb);
+	struct netcp_intf *netcp = ch->netcp;
 	struct device *dev = netcp->dev;
+	void *tx_pool = ch->pool;
 	dma_addr_t dma_addr;
 	unsigned int dma_sz;
 	int i;
@@ -1012,7 +1018,7 @@ netcp_tx_map_skb(struct sk_buff *skb, struct netcp_intf *netcp)
 		return NULL;
 	}
 
-	desc = knav_pool_desc_get(netcp->tx_pool);
+	desc = knav_pool_desc_get(tx_pool);
 	if (IS_ERR_OR_NULL(desc)) {
 		dev_err(netcp->ndev_dev, "out of TX desc\n");
 		dma_unmap_single(dev, dma_addr, pkt_len, DMA_TO_DEVICE);
@@ -1045,25 +1051,25 @@ netcp_tx_map_skb(struct sk_buff *skb, struct netcp_intf *netcp)
 			goto free_descs;
 		}
 
-		ndesc = knav_pool_desc_get(netcp->tx_pool);
+		ndesc = knav_pool_desc_get(tx_pool);
 		if (IS_ERR_OR_NULL(ndesc)) {
 			dev_err(netcp->ndev_dev, "out of TX desc for frags\n");
 			dma_unmap_page(dev, dma_addr, buf_len, DMA_TO_DEVICE);
 			goto free_descs;
 		}
 
-		desc_dma = knav_pool_desc_virt_to_dma(netcp->tx_pool, ndesc);
+		desc_dma = knav_pool_desc_virt_to_dma(tx_pool, ndesc);
 		knav_dma_set_pkt_info(dma_addr, buf_len, 0, ndesc);
 		desc_dma_32 = (u32)desc_dma;
 		knav_dma_set_words(&desc_dma_32, 1, &pdesc->next_desc);
 		pkt_len += buf_len;
 		if (pdesc != desc)
-			knav_pool_desc_map(netcp->tx_pool, pdesc,
+			knav_pool_desc_map(tx_pool, pdesc,
 					   sizeof(*pdesc), &desc_dma, &dma_sz);
 		pdesc = ndesc;
 	}
 	if (pdesc != desc)
-		knav_pool_desc_map(netcp->tx_pool, pdesc, sizeof(*pdesc),
+		knav_pool_desc_map(tx_pool, pdesc, sizeof(*pdesc),
 				   &dma_addr, &dma_sz);
 
 	/* frag list based linkage is not supported for now. */
@@ -1080,14 +1086,15 @@ upd_pkt_len:
 	return desc;
 
 free_descs:
-	netcp_free_tx_desc_chain(netcp, desc, sizeof(*desc));
+	netcp_free_tx_desc_chain(ch, desc, sizeof(*desc));
 	return NULL;
 }
 
-static int netcp_tx_submit_skb(struct netcp_intf *netcp,
+static int netcp_tx_submit_skb(struct netcp_channel *ch,
 			       struct sk_buff *skb,
 			       struct knav_dma_desc *desc)
 {
+	struct netcp_intf *netcp = ch->netcp;
 	struct netcp_tx_pipe *tx_pipe = NULL;
 	struct netcp_hook_list *tx_hook;
 	struct netcp_packet p_info;
@@ -1160,8 +1167,7 @@ static int netcp_tx_submit_skb(struct netcp_intf *netcp,
 	}
 
 	/* submit packet descriptor */
-	ret = knav_pool_desc_map(netcp->tx_pool, desc, sizeof(*desc), &dma,
-				 &dma_sz);
+	ret = knav_pool_desc_map(ch->pool, desc, sizeof(*desc), &dma, &dma_sz);
 	if (unlikely(ret)) {
 		dev_err(netcp->ndev_dev, "%s() failed to map desc\n", __func__);
 		ret = -ENOMEM;
@@ -1179,9 +1185,13 @@ static int netcp_ndo_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct netcp_intf *netcp = netdev_priv(ndev);
 	struct netcp_stats *tx_stats = &netcp->stats;
-	int subqueue = skb_get_queue_mapping(skb);
+	int idx = skb_get_queue_mapping(skb);
 	struct knav_dma_desc *desc;
+	struct netcp_channel *ch;
 	int desc_count, ret = 0;
+
+	if (idx >= netcp->tx_ch_count)
+		idx = netcp->tx_ch_count - 1;
 
 	if (unlikely(skb->len <= 0)) {
 		dev_kfree_skb(skb);
@@ -1200,14 +1210,15 @@ static int netcp_ndo_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		skb->len = NETCP_MIN_PACKET_SIZE;
 	}
 
-	desc = netcp_tx_map_skb(skb, netcp);
+	ch = &netcp->tx_ch[idx];
+	desc = netcp_tx_map_skb(skb, ch);
 	if (unlikely(!desc)) {
-		netif_stop_subqueue(ndev, subqueue);
+		netif_stop_subqueue(ndev, idx);
 		ret = -ENOBUFS;
 		goto drop;
 	}
 
-	ret = netcp_tx_submit_skb(netcp, skb, desc);
+	ret = netcp_tx_submit_skb(ch, skb, desc);
 	if (ret) {
 		ret = (ret < 0) ? ret : NETDEV_TX_OK;
 		goto drop;
@@ -1216,10 +1227,10 @@ static int netcp_ndo_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	netif_trans_update(ndev);
 
 	/* Check Tx pool count & stop subqueue if needed */
-	desc_count = knav_pool_count(netcp->tx_pool);
+	desc_count = knav_pool_count(ch->pool);
 	if (desc_count < netcp->tx_pause_threshold) {
 		dev_dbg(netcp->ndev_dev, "pausing tx, count(%d)\n", desc_count);
-		netif_stop_subqueue(ndev, subqueue);
+		netif_stop_subqueue(ndev, idx);
 	}
 	return NETDEV_TX_OK;
 
@@ -1227,7 +1238,7 @@ drop:
 	if (ret != NETDEV_TX_OK)
 		tx_stats->tx_dropped++;
 	if (desc)
-		netcp_free_tx_desc_chain(netcp, desc, sizeof(*desc));
+		netcp_free_tx_desc_chain(ch, desc, sizeof(*desc));
 	dev_kfree_skb(skb);
 	return ret;
 }
@@ -1296,6 +1307,46 @@ int netcp_txpipe_init(struct netcp_tx_pipe *tx_pipe,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(netcp_txpipe_init);
+
+static void netcp_split_channel_res(struct netcp_intf *netcp, int num)
+{
+	int pool_size, avr_pool_size;
+	struct netcp_channel *ch;
+	int i;
+
+	/* split descriptors between channels equally */
+	pool_size = netcp->tx_pool_size;
+	avr_pool_size = pool_size / num;
+	for (i = 0; i < num; i++) {
+		ch = &netcp->tx_ch[i];
+		ch->pool_size = avr_pool_size;
+		pool_size -= avr_pool_size;
+	}
+
+	/* use rest descs for most priority channel */
+	netcp->tx_ch->pool_size += pool_size;
+}
+
+static int netcp_create_tx_pools(struct net_device *ndev, int num)
+{
+	struct netcp_intf *netcp = netdev_priv(ndev);
+	struct netcp_channel *ch;
+	u8 name[16];
+	int i;
+
+	for (i = 0; i < num; i++) {
+		ch = &netcp->tx_ch[i];
+		snprintf(name, sizeof(name), "tx-pool-%d-%s", i, ndev->name);
+		ch->pool = knav_pool_create(name, ch->pool_size,
+					    netcp->tx_pool_region_id);
+		if (IS_ERR_OR_NULL(ch->pool)) {
+			dev_err(netcp->ndev_dev, "Couldn't create %s", name);
+			return PTR_ERR(ch->pool);
+		}
+	}
+
+	return 0;
+}
 
 static struct netcp_addr *netcp_addr_find(struct netcp_intf *netcp,
 					  const u8 *addr,
@@ -1467,6 +1518,7 @@ static void netcp_set_rx_mode(struct net_device *ndev)
 static void netcp_free_navigator_resources(struct netcp_intf *netcp)
 {
 	int i;
+	struct netcp_channel *ch;
 
 	if (netcp->rx_channel) {
 		knav_dma_close_channel(netcp->rx_channel);
@@ -1492,9 +1544,13 @@ static void netcp_free_navigator_resources(struct netcp_intf *netcp)
 		netcp->tx_compl_q = NULL;
 	}
 
-	if (!IS_ERR_OR_NULL(netcp->tx_pool)) {
-		knav_pool_destroy(netcp->tx_pool);
-		netcp->tx_pool = NULL;
+	for (i = 0; i < netcp->tx_ch_count; i++) {
+		ch = &netcp->tx_ch[i];
+		if (IS_ERR_OR_NULL(ch->pool))
+			continue;
+
+		knav_pool_destroy(ch->pool);
+		ch->pool = NULL;
 	}
 }
 
@@ -1511,21 +1567,17 @@ static int netcp_setup_navigator_resources(struct net_device *ndev)
 	/* Create Rx/Tx descriptor pools */
 	snprintf(name, sizeof(name), "rx-pool-%s", ndev->name);
 	netcp->rx_pool = knav_pool_create(name, netcp->rx_pool_size,
-						netcp->rx_pool_region_id);
+					  netcp->rx_pool_region_id);
 	if (IS_ERR_OR_NULL(netcp->rx_pool)) {
 		dev_err(netcp->ndev_dev, "Couldn't create rx pool\n");
 		ret = PTR_ERR(netcp->rx_pool);
 		goto fail;
 	}
 
-	snprintf(name, sizeof(name), "tx-pool-%s", ndev->name);
-	netcp->tx_pool = knav_pool_create(name, netcp->tx_pool_size,
-						netcp->tx_pool_region_id);
-	if (IS_ERR_OR_NULL(netcp->tx_pool)) {
-		dev_err(netcp->ndev_dev, "Couldn't create tx pool\n");
-		ret = PTR_ERR(netcp->tx_pool);
+	netcp_split_channel_res(netcp, netcp->tx_ch_count);
+	ret = netcp_create_tx_pools(ndev, netcp->tx_ch_count);
+	if (ret)
 		goto fail;
-	}
 
 	/* open Tx completion queue */
 	snprintf(name, sizeof(name), "tx-compl-%s", ndev->name);
@@ -1542,8 +1594,6 @@ static int netcp_setup_navigator_resources(struct net_device *ndev)
 	ret = knav_queue_device_control(netcp->tx_compl_q,
 					KNAV_QUEUE_SET_NOTIFIER,
 					(unsigned long)&notify_cfg);
-	if (ret)
-		goto fail;
 
 	knav_queue_disable_notify(netcp->tx_compl_q);
 
@@ -1641,6 +1691,7 @@ static int netcp_ndo_open(struct net_device *ndev)
 	napi_enable(&netcp->rx_napi);
 	napi_enable(&netcp->tx_napi);
 	knav_queue_enable_notify(netcp->tx_compl_q);
+
 	knav_queue_enable_notify(netcp->rx_queue);
 	netcp_rxpool_refill(netcp);
 	netif_tx_wake_all_queues(ndev);
@@ -1665,7 +1716,9 @@ static int netcp_ndo_stop(struct net_device *ndev)
 	struct netcp_intf *netcp = netdev_priv(ndev);
 	struct netcp_intf_modpriv *intf_modpriv;
 	struct netcp_module *module;
+	struct netcp_channel *ch;
 	int err = 0;
+	int i;
 
 	netif_tx_stop_all_queues(ndev);
 	netif_carrier_off(ndev);
@@ -1687,13 +1740,17 @@ static int netcp_ndo_stop(struct net_device *ndev)
 
 	/* Recycle Rx descriptors from completion queue */
 	netcp_empty_rx_queue(netcp);
-
 	/* Recycle Tx descriptors from completion queue */
 	netcp_process_tx_compl_packets(netcp, netcp->tx_pool_size);
 
-	if (knav_pool_count(netcp->tx_pool) != netcp->tx_pool_size)
-		dev_err(netcp->ndev_dev, "Lost (%d) Tx descs\n",
-			netcp->tx_pool_size - knav_pool_count(netcp->tx_pool));
+	for (i = 0; i < netcp->tx_ch_count; i++) {
+		ch = &netcp->tx_ch[i];
+		if (knav_pool_count(ch->pool) != ch->pool_size)
+			dev_err(netcp->ndev_dev,
+				"Lost (%d) Tx descs for pool %s,\n",
+				ch->pool_size - knav_pool_count(ch->pool),
+				knav_get_pool_name(ch->pool));
+	}
 
 	netcp_free_navigator_resources(netcp);
 	dev_dbg(netcp->ndev_dev, "netcp device %s stopped\n", ndev->name);
@@ -1747,9 +1804,17 @@ static int netcp_ndo_change_mtu(struct net_device *ndev, int new_mtu)
 static void netcp_ndo_tx_timeout(struct net_device *ndev)
 {
 	struct netcp_intf *netcp = netdev_priv(ndev);
-	unsigned int descs = knav_pool_count(netcp->tx_pool);
+	struct netcp_channel *ch;
+	unsigned int descs;
+	int i;
 
-	dev_err(netcp->ndev_dev, "transmit timed out tx descs(%d)\n", descs);
+	for (i = 0; i < netcp->tx_ch_count; i++) {
+		ch = &netcp->tx_ch[i];
+		descs = knav_pool_count(ch->pool);
+		dev_err(netcp->ndev_dev,
+			"transmit timed out tx queue %d descs(%d)\n", i, descs);
+	}
+
 	netcp_process_tx_compl_packets(netcp, netcp->tx_pool_size);
 	netif_trans_update(ndev);
 	netif_tx_wake_all_queues(ndev);
@@ -1906,10 +1971,10 @@ static int netcp_create_interface(struct netcp_device *netcp_device,
 	u32 efuse_mac = 0;
 	const void *mac_addr;
 	u8 efuse_mac_addr[6];
+	int i, ret = 0;
 	u32 temp[2];
-	int ret = 0;
 
-	ndev = alloc_etherdev_mqs(sizeof(*netcp), 1, 1);
+	ndev = alloc_etherdev_mqs(sizeof(*netcp), NETCP_MAX_TX_QUEUES, 1);
 	if (!ndev) {
 		dev_err(dev, "Error allocating netdev\n");
 		return -ENOMEM;
@@ -1919,6 +1984,12 @@ static int netcp_create_interface(struct netcp_device *netcp_device,
 	ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
 	ndev->hw_features = ndev->features;
 	ndev->vlan_features |=  NETIF_F_SG;
+
+	ret = netif_set_real_num_tx_queues(ndev, 1);
+	if (ret) {
+		dev_err(dev, "cannot set real number of tx queues\n");
+		goto quit;
+	}
 
 	netcp = netdev_priv(ndev);
 	spin_lock_init(&netcp->lock);
@@ -1936,6 +2007,7 @@ static int netcp_create_interface(struct netcp_device *netcp_device,
 	netcp->tx_pause_threshold = MAX_SKB_FRAGS;
 	netcp->tx_resume_threshold = netcp->tx_pause_threshold;
 	netcp->node_interface = node_interface;
+	netcp->tx_ch_count = 1;
 
 	ret = of_property_read_u32(node_interface, "efuse-mac", &efuse_mac);
 	if (efuse_mac) {
@@ -2025,12 +2097,16 @@ static int netcp_create_interface(struct netcp_device *netcp_device,
 		goto quit;
 	}
 
+
 	ret = of_property_read_u32(node_interface, "tx-completion-queue",
 				   &netcp->tx_compl_qid);
 	if (ret < 0) {
 		dev_warn(dev, "missing \"tx-completion-queue\" parameter\n");
 		netcp->tx_compl_qid = KNAV_QUEUE_QPEND;
 	}
+
+	for (i = 0; i < NETCP_MAX_TX_QUEUES; i++)
+		netcp->tx_ch[i].netcp = netcp;
 
 	/* NAPI register */
 	netif_napi_add(ndev, &netcp->rx_napi, netcp_rx_poll, NETCP_NAPI_WEIGHT);

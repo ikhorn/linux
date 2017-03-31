@@ -848,6 +848,14 @@ err:
 }
 EXPORT_SYMBOL_GPL(knav_pool_create);
 
+const char *knav_get_pool_name(void *ph)
+{
+	struct knav_pool *pool = ph;
+
+	return pool->name;
+}
+EXPORT_SYMBOL_GPL(knav_get_pool_name);
+
 /**
  * knav_pool_destroy()	- Free a pool of descriptors
  * @pool		- pool handle

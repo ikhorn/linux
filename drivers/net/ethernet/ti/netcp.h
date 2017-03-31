@@ -29,6 +29,7 @@
 #define NETCP_MAX_FRAME_SIZE		9504
 /* to indicate netcp core should drop the packet */
 #define NETCP_TX_DROP			1
+#define NETCP_MAX_TX_QUEUES		8
 
 #define SGMII_LINK_MAC_MAC_AUTONEG	0
 #define SGMII_LINK_MAC_PHY		1
@@ -88,17 +89,24 @@ struct netcp_stats {
 	u32                     tx_dropped;
 };
 
+struct netcp_channel {
+	void			*pool;
+	int			pool_size;
+	struct netcp_intf	*netcp;
+};
+
 struct netcp_intf {
 	struct device		*dev;
 	struct device		*ndev_dev;
 	struct net_device	*ndev;
 	bool			big_endian;
 	bool			bridged;
-	unsigned int		tx_compl_qid;
-	void			*tx_pool;
+	unsigned int            tx_compl_qid;
+	struct netcp_channel	tx_ch[NETCP_MAX_TX_QUEUES];
 	struct list_head	txhook_list_head;
 	unsigned int		tx_pause_threshold;
-	void			*tx_compl_q;
+	void                    *tx_compl_q;
+	int			tx_ch_count;
 
 	unsigned int		tx_resume_threshold;
 	void			*rx_queue;
