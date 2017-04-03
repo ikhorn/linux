@@ -37,6 +37,7 @@
 #include "netcp.h"
 
 #define MAX_SLAVES				8
+#define MAX_TX_QUEUES_NUM			8
 
 struct gbe_ss_regs_ofs {
 	u16	id_ver;
@@ -96,7 +97,8 @@ struct gbe_priv {
 	u8				max_num_slaves;
 	u8				max_num_ports; /* max_num_slaves + 1 */
 	u8				num_stats_mods;
-	struct netcp_tx_pipe		tx_pipe;
+	u8				tx_ch_count;
+	struct netcp_tx_pipe		tx_pipe[MAX_TX_QUEUES_NUM];
 
 	int				host_port;
 	u32				rx_packet_max;
@@ -119,8 +121,8 @@ struct gbe_priv {
 	struct gbe_host_port_regs_ofs	host_port_regs_ofs;
 
 	struct cpsw_ale			*ale;
-	unsigned int			tx_queue_id;
-	const char			*dma_chan_name;
+	unsigned int			tx_queue_id[MAX_TX_QUEUES_NUM];
+	const char			*dma_chan_name[MAX_TX_QUEUES_NUM];
 
 	struct list_head		gbe_intf_head;
 	struct list_head		secondary_slaves;
@@ -182,7 +184,7 @@ struct gbe_intf {
 	struct net_device	*ndev;
 	struct device		*dev;
 	struct gbe_priv		*gbe_dev;
-	struct netcp_tx_pipe	tx_pipe;
+	struct netcp_tx_pipe	*tx_pipe;
 	struct gbe_slave	*slave;
 	struct list_head	gbe_intf_list;
 	unsigned long		active_vlans[BITS_TO_LONGS(VLAN_N_VID)];

@@ -2858,7 +2858,21 @@ static int gbe_txhook(int order, void *data, struct netcp_packet *p_info)
 {
 	struct gbe_intf *gbe_intf = data;
 
-	p_info->tx_pipe = &gbe_intf->tx_pipe;
+	p_info->tx_pipe = gbe_intf->tx_pipe;
+
+	return gbe_txtstamp_mark_pkt(gbe_intf, p_info);
+}
+
+static int gbe_mq_txhook(int order, void *data, struct netcp_packet *p_info)
+{
+	struct gbe_intf *gbe_intf = data;
+	int idx;
+
+	idx = skb_get_queue_mapping(p_info->skb);
+	if (idx >= gbe_intf->gbe_dev->tx_ch_count)
+		idx = gbe_intf->gbe_dev->tx_ch_count;
+
+	p_info->tx_pipe = &gbe_intf->tx_pipe[idx];
 
 	return gbe_txtstamp_mark_pkt(gbe_intf, p_info);
 }
@@ -2877,29 +2891,33 @@ static int gbe_open(void *intf_priv, struct net_device *ndev)
 	struct netcp_intf *netcp = netdev_priv(ndev);
 	struct gbe_slave *slave = gbe_intf->slave;
 	int port_num = slave->port_num;
+	netcp_hook_rtn *tx_hook;
 	u32 reg, val;
-	int ret;
+	int ret, i;
 
 	reg = readl(GBE_REG_ADDR(gbe_dev, switch_regs, id_ver));
 	dev_dbg(gbe_dev->dev, "initializing gbe version %d.%d (%d) GBE identification value 0x%x\n",
 		GBE_MAJOR_VERSION(reg), GBE_MINOR_VERSION(reg),
 		GBE_RTL_VERSION(reg), GBE_IDENT(reg));
 
-	/* For 10G and on NetCP 1.5, use directed to port */
-	if ((gbe_dev->ss_version == XGBE_SS_VERSION_10) || IS_SS_ID_MU(gbe_dev))
-		gbe_intf->tx_pipe.flags = SWITCH_TO_PORT_IN_TAGINFO;
+	for (i = 0; i < gbe_dev->tx_ch_count; i++) {
+		/* For 10G and on NetCP 1.5, use directed to port */
+		if ((gbe_dev->ss_version == XGBE_SS_VERSION_10) ||
+		    IS_SS_ID_MU(gbe_dev))
+			gbe_intf->tx_pipe[i].flags = SWITCH_TO_PORT_IN_TAGINFO;
 
-	if (gbe_dev->enable_ale)
-		gbe_intf->tx_pipe.switch_to_port = 0;
-	else
-		gbe_intf->tx_pipe.switch_to_port = port_num;
+		if (gbe_dev->enable_ale)
+			gbe_intf->tx_pipe[i].switch_to_port = 0;
+		else
+			gbe_intf->tx_pipe[i].switch_to_port = port_num;
 
-	dev_dbg(gbe_dev->dev,
-		"opened TX channel %s: %p with to port %d, flags %d\n",
-		gbe_intf->tx_pipe.dma_chan_name,
-		gbe_intf->tx_pipe.dma_channel,
-		gbe_intf->tx_pipe.switch_to_port,
-		gbe_intf->tx_pipe.flags);
+		dev_dbg(gbe_dev->dev,
+			"opened TX channel %s: %p with to port %d, flags %d\n",
+			gbe_intf->tx_pipe[i].dma_chan_name,
+			gbe_intf->tx_pipe[i].dma_channel,
+			gbe_intf->tx_pipe[i].switch_to_port,
+			gbe_intf->tx_pipe[i].flags);
+	}
 
 	gbe_slave_stop(gbe_intf);
 
@@ -2930,7 +2948,8 @@ static int gbe_open(void *intf_priv, struct net_device *ndev)
 	if (ret)
 		goto fail;
 
-	netcp_register_txhook(netcp, GBE_TXHOOK_ORDER, gbe_txhook, gbe_intf);
+	tx_hook = gbe_dev->tx_ch_count == 1 ? gbe_txhook : gbe_mq_txhook;
+	netcp_register_txhook(netcp, GBE_TXHOOK_ORDER, tx_hook, gbe_intf);
 	netcp_register_rxhook(netcp, GBE_RXHOOK_ORDER, gbe_rxhook, gbe_intf);
 
 	slave->open = true;
@@ -2950,13 +2969,15 @@ static int gbe_close(void *intf_priv, struct net_device *ndev)
 	struct gbe_intf *gbe_intf = intf_priv;
 	struct netcp_intf *netcp = netdev_priv(ndev);
 	struct gbe_priv *gbe_dev = gbe_intf->gbe_dev;
+	netcp_hook_rtn *tx_hook;
 
 	gbe_unregister_cpts(gbe_dev);
 
 	gbe_slave_stop(gbe_intf);
 
+	tx_hook = gbe_dev->tx_ch_count == 1 ? gbe_txhook : gbe_mq_txhook;
 	netcp_unregister_rxhook(netcp, GBE_RXHOOK_ORDER, gbe_rxhook, gbe_intf);
-	netcp_unregister_txhook(netcp, GBE_TXHOOK_ORDER, gbe_txhook, gbe_intf);
+	netcp_unregister_txhook(netcp, GBE_TXHOOK_ORDER, tx_hook, gbe_intf);
 
 	gbe_intf->slave->open = false;
 	atomic_set(&gbe_intf->slave->link_state, NETCP_LINK_STATE_INVALID);
@@ -3651,6 +3672,7 @@ static int gbe_probe(struct netcp_device *netcp_device, struct device *dev,
 	struct phy *phy;
 	u32 slave_num;
 	int i, ret = 0;
+	int tx_num;
 
 	if (!node) {
 		dev_err(dev, "device tree info unavailable\n");
@@ -3680,6 +3702,7 @@ static int gbe_probe(struct netcp_device *netcp_device, struct device *dev,
 	gbe_dev->dev = dev;
 	gbe_dev->netcp_device = netcp_device;
 	gbe_dev->rx_packet_max = NETCP_MAX_FRAME_SIZE;
+	gbe_dev->tx_ch_count = 1;
 
 	/* init the hw stats lock */
 	spin_lock_init(&gbe_dev->hw_stats_lock);
@@ -3692,15 +3715,21 @@ static int gbe_probe(struct netcp_device *netcp_device, struct device *dev,
 		dev_dbg(dev, "ALE bypass enabled*\n");
 	}
 
-	ret = of_property_read_u32(node, "tx-queue",
-				   &gbe_dev->tx_queue_id);
+	tx_num = of_property_count_u32_elems(node, "tx-queue");
+	ret = of_property_read_u32_array(node, "tx-queue",
+					 gbe_dev->tx_queue_id, tx_num);
 	if (ret < 0) {
 		dev_err(dev, "missing tx_queue parameter\n");
-		gbe_dev->tx_queue_id = GBE_TX_QUEUE;
+		gbe_dev->tx_queue_id[0] = GBE_TX_QUEUE;
 	}
 
-	ret = of_property_read_string(node, "tx-channel",
-				      &gbe_dev->dma_chan_name);
+	if (tx_num != of_property_count_strings(node, "tx-channel")) {
+		dev_err(dev, "number of tx channels != tx queues\n");
+		return -EINVAL;
+	}
+
+	ret = of_property_read_string_array(node, "tx-channel",
+					    gbe_dev->dma_chan_name, tx_num);
 	if (ret < 0) {
 		dev_err(dev, "missing \"tx-channel\" parameter\n");
 		return -EINVAL;
@@ -3734,12 +3763,13 @@ static int gbe_probe(struct netcp_device *netcp_device, struct device *dev,
 	if (!interfaces)
 		dev_err(dev, "could not find interfaces\n");
 
-	ret = netcp_txpipe_init(&gbe_dev->tx_pipe, netcp_device,
-				gbe_dev->dma_chan_name, gbe_dev->tx_queue_id);
+	ret = netcp_txpipe_init(&gbe_dev->tx_pipe[0], netcp_device,
+				gbe_dev->dma_chan_name[0],
+				gbe_dev->tx_queue_id[0]);
 	if (ret)
 		goto exit_err;
 
-	ret = netcp_txpipe_open(&gbe_dev->tx_pipe);
+	ret = netcp_txpipe_open(&gbe_dev->tx_pipe[0]);
 	if (ret)
 		goto exit_err;
 
@@ -3910,12 +3940,15 @@ static int gbe_release(void *intf_priv)
 static int gbe_remove(struct netcp_device *netcp_device, void *inst_priv)
 {
 	struct gbe_priv *gbe_dev = inst_priv;
+	int i;
 
 	del_timer_sync(&gbe_dev->timer);
 	cpts_release(gbe_dev->cpts);
 	cpsw_ale_stop(gbe_dev->ale);
 	cpsw_ale_destroy(gbe_dev->ale);
-	netcp_txpipe_close(&gbe_dev->tx_pipe);
+	for (i = 0; i < gbe_dev->tx_ch_count; i++)
+		netcp_txpipe_close(&gbe_dev->tx_pipe[i]);
+
 	gbe_remove_sysfs_entries(gbe_dev);
 	free_secondary_ports(gbe_dev);
 
