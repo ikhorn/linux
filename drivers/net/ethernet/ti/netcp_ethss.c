@@ -1581,6 +1581,8 @@ static const struct netcp_ethtool_stat xgbe10_et_stats[] = {
 			struct gbe_slave, slave_list)
 
 static int gbe_port_reset(struct gbe_slave *slave);
+static int gbe_txhook(int order, void *data, struct netcp_packet *p_info);
+static int gbe_mq_txhook(int order, void *data, struct netcp_packet *p_info);
 
 static void keystone_get_drvinfo(struct net_device *ndev,
 				 struct ethtool_drvinfo *info)
@@ -1884,6 +1886,172 @@ static int keystone_get_ts_info(struct net_device *ndev,
 }
 #endif /* CONFIG_TI_CPTS */
 
+static int gbe_update_pipes(struct gbe_intf *gbe_intf, int ch_num)
+{
+	struct gbe_priv *gbe_dev = gbe_intf->gbe_dev;
+	u8 *ch = &gbe_dev->tx_ch_count;
+	int ret;
+
+	/* add pipes */
+	while (*ch < ch_num) {
+		unsigned char dma_chan_name[10];
+
+		sprintf(dma_chan_name, "nettx%d", *ch);
+		ret = netcp_txpipe_init(&gbe_dev->tx_pipe[*ch],
+					gbe_dev->netcp_device,
+					dma_chan_name,
+					gbe_dev->tx_queue_id[*ch]);
+		if (ret)
+			return ret;
+
+		ret = netcp_txpipe_open(&gbe_dev->tx_pipe[*ch]);
+		if (ret)
+			return ret;
+
+		/* For 10G and on NetCP 1.5, use directed to port */
+		if ((gbe_dev->ss_version == XGBE_SS_VERSION_10) ||
+		    IS_SS_ID_MU(gbe_dev))
+			gbe_dev->tx_pipe[*ch].flags = SWITCH_TO_PORT_IN_TAGINFO;
+
+		if (gbe_dev->enable_ale) {
+			gbe_dev->tx_pipe[*ch].switch_to_port = 0;
+		} else {
+			struct gbe_slave *slave = gbe_intf->slave;
+			int port_num = slave->port_num;
+
+			gbe_dev->tx_pipe[*ch].switch_to_port = port_num;
+		}
+
+		dev_info(gbe_dev->dev, "created new tx channel - tx%d\n", *ch);
+		(*ch)++;
+	}
+
+	/* or delete pipes */
+	while (*ch > ch_num) {
+		(*ch)--;
+
+		netcp_txpipe_close(&gbe_dev->tx_pipe[*ch]);
+		dev_info(gbe_dev->dev, "destroyed tx%d channel\n", *ch);
+	}
+
+	return 0;
+}
+
+static void keystone_get_channels(struct net_device *ndev,
+				  struct ethtool_channels *ch)
+{
+	struct netcp_intf *netcp = netdev_priv(ndev);
+	struct gbe_intf *gbe_intf;
+	struct gbe_priv *gbe_dev;
+
+	gbe_intf = keystone_get_intf_data(netcp);
+	if (!gbe_intf) {
+		dev_err(&ndev->dev, "cannot get channels number\n");
+		return;
+	}
+
+	gbe_dev = gbe_intf->gbe_dev;
+
+	ch->max_combined = 0;
+	ch->max_rx = 1;
+
+	/* limit only for cpsw-2u */
+	if (gbe_dev->max_num_slaves == 1)
+		ch->max_tx = MAX_TX_QUEUES_NUM;
+	else
+		ch->max_tx = 1;
+
+	ch->max_other = 0;
+	ch->other_count = 0;
+	ch->rx_count = 1;
+	ch->tx_count = gbe_dev->tx_ch_count;
+	ch->combined_count = 0;
+}
+
+static int gbe_check_ch_settings(struct net_device *ndev,
+				 struct ethtool_channels *ch)
+{
+	struct netcp_intf *netcp = netdev_priv(ndev);
+	struct gbe_intf *gbe_intf;
+	struct gbe_priv *gbe_dev;
+
+	/* verify we have at least one channel in each direction */
+	if (!ch->rx_count || !ch->tx_count)
+		return -EINVAL;
+
+	if (ch->combined_count)
+		return -EINVAL;
+
+	gbe_intf = keystone_get_intf_data(netcp);
+	if (!gbe_intf)
+		return -EINVAL;
+
+	/* limit only for cpsw-2u types of gbe */
+	gbe_dev = gbe_intf->gbe_dev;
+	if (!IS_SS_ID_2U(gbe_dev))
+		return -EINVAL;
+
+	/* check if gbe has been assigned with required number of resources */
+	if (ch->tx_count > gbe_dev->max_tx_ch_num)
+		return -EINVAL;
+
+	if (ch->rx_count > 1 ||
+	    ch->tx_count > MAX_TX_QUEUES_NUM)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int gbe_set_tx_channels(struct netcp_intf *netcp, int ch_num)
+{
+	struct gbe_intf *gbe_intf;
+	struct gbe_priv *gbe_dev;
+	netcp_hook_rtn *tx_hook;
+	int need_new_hook;
+	int ret;
+
+	gbe_intf = keystone_get_intf_data(netcp);
+	if (!gbe_intf)
+		return -EINVAL;
+
+	gbe_dev = gbe_intf->gbe_dev;
+	need_new_hook = netif_running(netcp->ndev) &&
+			(gbe_dev->tx_ch_count == 1 || ch_num == 1);
+
+	if (need_new_hook) {
+		tx_hook = gbe_dev->tx_ch_count == 1 ? gbe_txhook :
+						      gbe_mq_txhook;
+		netcp_unregister_txhook(netcp, GBE_TXHOOK_ORDER,
+					tx_hook, gbe_intf);
+
+		tx_hook = ch_num == 1 ? gbe_txhook : gbe_mq_txhook;
+		netcp_register_txhook(netcp, GBE_TXHOOK_ORDER,
+				      tx_hook, gbe_intf);
+	}
+
+	ret = gbe_update_pipes(gbe_intf, ch_num);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int keystone_set_channels(struct net_device *ndev,
+				 struct ethtool_channels *chs)
+{
+	int ret;
+
+	ret = gbe_check_ch_settings(ndev, chs);
+	if (ret < 0)
+		return ret;
+
+	ret = netcp_set_tx_channels(ndev, gbe_set_tx_channels, chs);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 static const struct ethtool_ops keystone_ethtool_ops = {
 	.get_drvinfo		= keystone_get_drvinfo,
 	.get_link		= ethtool_op_get_link,
@@ -1895,6 +2063,8 @@ static const struct ethtool_ops keystone_ethtool_ops = {
 	.get_settings		= keystone_get_settings,
 	.set_settings		= keystone_set_settings,
 	.get_ts_info		= keystone_get_ts_info,
+	.get_channels		= keystone_get_channels,
+	.set_channels		= keystone_set_channels,
 };
 
 #define mac_hi(mac)	(((mac)[0] << 0) | ((mac)[1] << 8) |	\
@@ -3734,6 +3904,8 @@ static int gbe_probe(struct netcp_device *netcp_device, struct device *dev,
 		dev_err(dev, "missing \"tx-channel\" parameter\n");
 		return -EINVAL;
 	}
+
+	gbe_dev->max_tx_ch_num = tx_num;
 
 	if (!strcmp(node->name, "gbe")) {
 		ret = get_gbe_resource_version(gbe_dev, node);

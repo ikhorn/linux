@@ -98,6 +98,7 @@ struct gbe_priv {
 	u8				max_num_ports; /* max_num_slaves + 1 */
 	u8				num_stats_mods;
 	u8				tx_ch_count;
+	int				max_tx_ch_num;
 	struct netcp_tx_pipe		tx_pipe[MAX_TX_QUEUES_NUM];
 
 	int				host_port;
