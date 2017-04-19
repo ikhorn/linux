@@ -246,6 +246,10 @@ int netcp_txpipe_init(struct netcp_tx_pipe *tx_pipe,
 		      const char *dma_chan_name, unsigned int dma_queue_id);
 int netcp_txpipe_open(struct netcp_tx_pipe *tx_pipe);
 int netcp_txpipe_close(struct netcp_tx_pipe *tx_pipe);
+int netcp_set_tx_channels(struct net_device *ndev,
+			  int module_set_chs(struct netcp_intf *netcp,
+					     int ch_num),
+			  struct ethtool_channels *chs);
 
 typedef int netcp_hook_rtn(int order, void *data, struct netcp_packet *packet);
 int netcp_register_txhook(struct netcp_intf *netcp_priv, int order,

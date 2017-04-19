@@ -1327,6 +1327,34 @@ static void netcp_split_channel_res(struct netcp_intf *netcp, int num)
 	netcp->tx_ch->pool_size += pool_size;
 }
 
+static void netcp_suspend_tx_data_pass(struct netcp_intf *netcp)
+{
+	struct netcp_channel *ch;
+	int i;
+
+	/* stop send & receive data */
+	netif_tx_stop_all_queues(netcp->ndev);
+	knav_queue_disable_notify(netcp->tx_compl_q);
+	napi_disable(&netcp->tx_napi);
+
+	/* Recycle Tx descriptors from completion queue */
+	netcp_process_tx_compl_packets(netcp, netcp->tx_pool_size);
+	for (i = 0; i < netcp->tx_ch_count; i++) {
+		ch = &netcp->tx_ch[i];
+
+		if (knav_pool_count(ch->pool) != ch->pool_size)
+			dev_err(netcp->ndev_dev, "Lost (%d) Tx descs\n",
+				ch->pool_size - knav_pool_count(ch->pool));
+	}
+}
+
+static void netcp_resume_tx_data_pass(struct netcp_intf *netcp)
+{
+	napi_enable(&netcp->tx_napi);
+	knav_queue_enable_notify(netcp->tx_compl_q);
+	netif_tx_wake_all_queues(netcp->ndev);
+}
+
 static int netcp_create_tx_pools(struct net_device *ndev, int num)
 {
 	struct netcp_intf *netcp = netdev_priv(ndev);
@@ -1347,6 +1375,72 @@ static int netcp_create_tx_pools(struct net_device *ndev, int num)
 
 	return 0;
 }
+
+static int netcp_update_tx_pool_num(struct net_device *ndev, int num)
+{
+	struct netcp_intf *netcp = netdev_priv(ndev);
+	struct netcp_channel *ch;
+	int i;
+
+	/* as pool size is set while creation, need to destroy tx pools
+	 * and create new number of pools with new number of descs
+	 */
+	for (i = 0; i < netcp->tx_ch_count; i++) {
+		ch = &netcp->tx_ch[i];
+		if (IS_ERR_OR_NULL(ch->pool))
+			continue;
+
+		knav_pool_destroy(ch->pool);
+		ch->pool = NULL;
+	}
+
+	return netcp_create_tx_pools(ndev, num);
+}
+
+int netcp_set_tx_channels(struct net_device *ndev,
+			  int module_set_chs(struct netcp_intf *netcp,
+					     int ch_num),
+			  struct ethtool_channels *chs)
+{
+	struct netcp_intf *netcp = netdev_priv(ndev);
+	int ret;
+
+	/* suspend data pass for tx and rx */
+	if (netif_running(ndev))
+		netcp_suspend_tx_data_pass(netcp);
+
+	/* update num of channels for module */
+	ret = module_set_chs(netcp, chs->tx_count);
+	if (ret)
+		goto err;
+
+	/* update tx pools and completion queues */
+	netcp_split_channel_res(netcp, chs->tx_count);
+	if (netif_running(ndev)) {
+		ret = netcp_update_tx_pool_num(ndev, chs->tx_count);
+		if (ret)
+			goto err;
+	}
+
+	netcp->tx_ch_count = chs->tx_count;
+
+	/* Inform stack about new count of queues */
+	ret = netif_set_real_num_tx_queues(ndev, netcp->tx_ch_count);
+	if (ret) {
+		dev_err(&ndev->dev, "cannot set real number of tx queues\n");
+		goto err;
+	}
+
+	if (netif_running(ndev))
+		netcp_resume_tx_data_pass(netcp);
+	return 0;
+
+err:
+	dev_err(&ndev->dev, "cannot update channels number, closing device\n");
+	dev_close(ndev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(netcp_set_tx_channels);
 
 static struct netcp_addr *netcp_addr_find(struct netcp_intf *netcp,
 					  const u8 *addr,
