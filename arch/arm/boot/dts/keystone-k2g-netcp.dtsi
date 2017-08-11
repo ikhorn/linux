@@ -54,7 +54,7 @@ qmss: qmss@4020000 {
 		};
 		general-purpose {
 			gp-0 {
-				qrange = <112 8>;
+				qrange = <112 16>;
 			};
 			netcp-tx {
 				qrange = <5 8>;
