@@ -73,6 +73,7 @@ struct gbe_host_port_regs_ofs {
 	u16	port_vlan;
 	u16	tx_pri_map;
 	u16	rx_maxlen;
+	u16	rx_pri_map;
 };
 
 struct gbe_emac_regs_ofs {

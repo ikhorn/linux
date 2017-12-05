@@ -1264,7 +1264,7 @@ int netcp_txpipe_open(struct netcp_tx_pipe *tx_pipe)
 	config.direction = DMA_MEM_TO_DEV;
 	config.u.tx.filt_einfo = false;
 	config.u.tx.filt_pswords = false;
-	config.u.tx.priority = DMA_PRIO_MED_L;
+	config.u.tx.priority = tx_pipe->priority;
 
 	tx_pipe->dma_channel = knav_dma_open_channel(dev,
 				tx_pipe->dma_chan_name, &config);
@@ -1298,12 +1298,14 @@ EXPORT_SYMBOL_GPL(netcp_txpipe_open);
 
 int netcp_txpipe_init(struct netcp_tx_pipe *tx_pipe,
 		      struct netcp_device *netcp_device,
-		      const char *dma_chan_name, unsigned int dma_queue_id)
+		      const char *dma_chan_name, unsigned int dma_queue_id,
+		      int priority)
 {
 	memset(tx_pipe, 0, sizeof(*tx_pipe));
 	tx_pipe->netcp_device = netcp_device;
 	tx_pipe->dma_chan_name = dma_chan_name;
 	tx_pipe->dma_queue_id = dma_queue_id;
+	tx_pipe->priority = priority;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(netcp_txpipe_init);

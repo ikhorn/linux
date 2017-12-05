@@ -54,6 +54,7 @@ struct netcp_tx_pipe {
 	u8			flags;
 	void			*dma_channel;
 	const char		*dma_chan_name;
+	u8			priority;
 };
 
 #define ADDR_NEW			BIT(0)
@@ -243,7 +244,8 @@ void *netcp_module_get_intf_data(struct netcp_module *module,
 
 int netcp_txpipe_init(struct netcp_tx_pipe *tx_pipe,
 		      struct netcp_device *netcp_device,
-		      const char *dma_chan_name, unsigned int dma_queue_id);
+		      const char *dma_chan_name, unsigned int dma_queue_id,
+		      int priority);
 int netcp_txpipe_open(struct netcp_tx_pipe *tx_pipe);
 int netcp_txpipe_close(struct netcp_tx_pipe *tx_pipe);
 int netcp_set_tx_channels(struct net_device *ndev,

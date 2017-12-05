@@ -159,6 +159,7 @@
 #define GBE_REG_OFS(p, rb, rn) ((p)->rb##_ofs.rn)
 
 #define HOST_TX_PRI_MAP_DEFAULT			0x00000000
+#define HOST_TX_PRI_MAP_ORDER			0x76543210
 #define SGMII_MODULE_SIZE			0x100
 
 #if IS_ENABLED(CONFIG_TI_CPTS)
@@ -1900,7 +1901,8 @@ static int gbe_update_pipes(struct gbe_intf *gbe_intf, int ch_num)
 		ret = netcp_txpipe_init(&gbe_dev->tx_pipe[*ch],
 					gbe_dev->netcp_device,
 					dma_chan_name,
-					gbe_dev->tx_queue_id[*ch]);
+					gbe_dev->tx_queue_id[*ch],
+					ch_num);
 		if (ret)
 			return ret;
 
@@ -2436,7 +2438,7 @@ static int gbe_slave_open(struct gbe_intf *gbe_intf)
 	 * as we only configure to use priority 0
 	 */
 	if (IS_SS_ID_MU(priv))
-		writel(HOST_TX_PRI_MAP_DEFAULT,
+		writel(HOST_TX_PRI_MAP_ORDER,
 		       GBE_REG_ADDR(slave, port_regs, rx_pri_map));
 
 	/* enable forwarding */
@@ -2494,9 +2496,12 @@ static void gbe_init_host_port(struct gbe_priv *priv)
 	int bypass_en = 1;
 
 	/* Host Tx Pri */
-	if (IS_SS_ID_NU(priv) || IS_SS_ID_XGBE(priv))
+	if (IS_SS_ID_NU(priv) || IS_SS_ID_XGBE(priv)) {
 		writel(HOST_TX_PRI_MAP_DEFAULT,
 		       GBE_REG_ADDR(priv, host_port_regs, tx_pri_map));
+	} else if (IS_SS_ID_2U(priv))
+		writel(HOST_TX_PRI_MAP_ORDER,
+		       GBE_REG_ADDR(priv, host_port_regs, rx_pri_map));
 
 	/* Max length register */
 	writel(NETCP_MAX_FRAME_SIZE, GBE_REG_ADDR(priv, host_port_regs,
@@ -3829,6 +3834,9 @@ static int set_gbenu_ethss_priv(struct gbe_priv *gbe_dev,
 	 * while 2U has only 1 such thread
 	 */
 	GBENU_SET_REG_OFS(gbe_dev, host_port_regs, tx_pri_map);
+
+	/* For 2U only */
+	GBENU_SET_REG_OFS(gbe_dev, host_port_regs, rx_pri_map);
 	return 0;
 }
 
@@ -3937,7 +3945,7 @@ static int gbe_probe(struct netcp_device *netcp_device, struct device *dev,
 
 	ret = netcp_txpipe_init(&gbe_dev->tx_pipe[0], netcp_device,
 				gbe_dev->dma_chan_name[0],
-				gbe_dev->tx_queue_id[0]);
+				gbe_dev->tx_queue_id[0], 0);
 	if (ret)
 		goto exit_err;
 

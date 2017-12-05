@@ -345,7 +345,7 @@ static int pa_core_init_egress_tx_pipe(struct pa_core_device *core_dev,
 	/* initialize txpipe for tx egress cluster for pa device */
 	netcp_txpipe_init(&core_dev->tx_pipe, netcp_device,
 			  cfg->tx_chan_name,
-			  cfg->tx_queue_id);
+			  cfg->tx_queue_id, 0);
 
 	ret = netcp_txpipe_open(&core_dev->tx_pipe);
 	if (ret) {
