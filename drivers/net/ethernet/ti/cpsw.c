@@ -658,6 +658,64 @@ struct addr_sync_ctx {
 	int flush;		/* flush flag */
 };
 
+struct addr_check_ctx {
+	const u8 *addr;
+	int vid;
+};
+
+static int cpsw_check_vlan_addr(struct net_device *vdev, int vid, void *ctx)
+{
+	struct addr_check_ctx *addr_ctx = ctx;
+	struct netdev_hw_addr *ha;
+
+	if (addr_ctx->vid != vid || !vdev || !(vdev->flags & IFF_UP))
+		return 0;
+
+	if (is_multicast_ether_addr(addr_ctx->addr)) {
+		netdev_for_each_mc_addr(ha, vdev)
+			if (ether_addr_equal(ha->addr, addr_ctx->addr))
+				return ha->sync_cnt;
+
+		return 0;
+	}
+
+	if (ether_addr_equal(vdev->dev_addr, addr_ctx->addr))
+		return 1;
+
+	/* vlan address is relevant if its sync_cnt != 0 */
+	netdev_for_each_uc_addr(ha, vdev)
+		if (ether_addr_equal(ha->addr, addr_ctx->addr))
+			return ha->sync_cnt;
+
+	return 0;
+}
+
+static int cpsw_addr_is_reused(struct net_device *ndev, int vid, const u8 *addr)
+{
+	struct cpsw_priv *priv = netdev_priv(ndev);
+	struct cpsw_common *cpsw = priv->cpsw;
+	struct addr_check_ctx addr_ctx;
+	struct net_device *ndev2;
+	int i, ret;
+
+	if (vid == cpsw->slaves[priv->emac_port].port_vlan)
+		return 0;
+
+	addr_ctx.addr = addr;
+	addr_ctx.vid = vid;
+	for (i = 0; i < cpsw->data.slaves; i++) {
+		ndev2 = cpsw->slaves[i].ndev;
+		if (!ndev2 || ndev2 == ndev || !(ndev2->flags & IFF_UP))
+			continue;
+
+		ret = vlan_for_each(ndev2, cpsw_check_vlan_addr, &addr_ctx);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 /**
  * cpsw_set_mc - adds multicast entry to the table if it's not added or deletes
  * if it's not deleted
@@ -683,10 +741,15 @@ static int cpsw_set_mc(struct net_device *ndev, const u8 *addr,
 	mask = cpsw->data.dual_emac ? ALE_PORT_HOST : ALE_ALL_PORTS;
 	flags = vid ? ALE_VLAN : 0;
 
-	if (add)
+	if (add) {
 		ret = cpsw_ale_add_mcast(cpsw->ale, addr, mask, flags, vid, 0);
-	else
+	} else {
+		if (cpsw->data.dual_emac)
+			if (cpsw_addr_is_reused(ndev, vid, addr))
+				return 0;
+
 		ret = cpsw_ale_del_mcast(cpsw->ale, addr, 0, flags, vid);
+	}
 
 	return ret;
 }
@@ -708,10 +771,15 @@ static int cpsw_set_uc(struct net_device *ndev, const u8 *addr,
 	port = HOST_PORT_NUM;
 	flags = vid ? ALE_VLAN : 0;
 
-	if (add)
+	if (add) {
 		ret = cpsw_ale_add_ucast(cpsw->ale, addr, port, flags, vid);
-	else
+	} else {
+		if (cpsw->data.dual_emac)
+			if (cpsw_addr_is_reused(ndev, vid, addr))
+				return 0;
+
 		ret = cpsw_ale_del_ucast(cpsw->ale, addr, port, flags, vid);
+	}
 
 	return ret;
 }
