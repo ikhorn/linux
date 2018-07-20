@@ -691,6 +691,31 @@ static int cpsw_set_mc(struct net_device *ndev, const u8 *addr,
 	return ret;
 }
 
+static int cpsw_set_uc(struct net_device *ndev, const u8 *addr,
+		       int vid, int add)
+{
+	struct cpsw_priv *priv = netdev_priv(ndev);
+	struct cpsw_common *cpsw = priv->cpsw;
+	int flags, port, ret;
+
+	if (vid < 0) {
+		if (cpsw->data.dual_emac)
+			vid = cpsw->slaves[priv->emac_port].port_vlan;
+		else
+			vid = 0;
+	}
+
+	port = HOST_PORT_NUM;
+	flags = vid ? ALE_VLAN : 0;
+
+	if (add)
+		ret = cpsw_ale_add_ucast(cpsw->ale, addr, port, flags, vid);
+	else
+		ret = cpsw_ale_del_ucast(cpsw->ale, addr, port, flags, vid);
+
+	return ret;
+}
+
 static int cpsw_update_vlan_mc(struct net_device *vdev, int vid, void *ctx)
 {
 	struct addr_sync_ctx *sync_ctx = ctx;
@@ -796,6 +821,139 @@ static int cpsw_purge_all_mc(struct net_device *ndev, const u8 *addr, int num)
 	return 0;
 }
 
+static int cpsw_update_vlan_uc(struct net_device *vdev, int vid, void *ctx)
+{
+	struct addr_sync_ctx *sync_ctx = ctx;
+	struct netdev_hw_addr *ha;
+	unsigned char *ndev_addr;
+	struct net_device *ndev;
+	int found = 0, ret = 0;
+
+	if (!vdev || !(vdev->flags & IFF_UP))
+		return ret;
+
+	if (ether_addr_equal(vdev->dev_addr, sync_ctx->addr)) {
+		found = 1;
+	} else {
+		/* vlan address is relevant if its sync_cnt != 0 */
+		netdev_for_each_uc_addr(ha, vdev) {
+			if (ether_addr_equal(ha->addr, sync_ctx->addr)) {
+				found = ha->sync_cnt ? 2 : 0;
+				break;
+			}
+		}
+	}
+
+	if (found)
+		sync_ctx->consumed++;
+
+	ndev = sync_ctx->ndev;
+	ndev_addr = ndev->dev_addr;
+	if (sync_ctx->flush) {
+		if (found)
+			return ret;
+
+		cpsw_set_uc(ndev, sync_ctx->addr, vid, 0);
+
+		/* no event if real device address is same, so set it now */
+		if (ether_addr_equal(vdev->dev_addr, ndev_addr))
+			ret = cpsw_set_uc(ndev, vdev->dev_addr, vid, 1);
+		return ret;
+	}
+
+	if (!found)
+		return ret;
+
+	ret = cpsw_set_uc(ndev, sync_ctx->addr, vid, 1);
+	if (ret || found == 2)
+		return ret;
+
+	/* delete potential previous real dev vlan address, as no event */
+	netdev_for_each_uc_addr(ha, vdev) {
+		if (ether_addr_equal(ha->addr, ndev_addr))
+			return ret;
+	}
+
+	cpsw_set_uc(ndev, ndev_addr, vid, 0);
+	return ret;
+}
+
+static int cpsw_add_uc_addr(struct net_device *ndev, const u8 *addr, int num)
+{
+	struct addr_sync_ctx sync_ctx;
+	int ret;
+
+	sync_ctx.consumed = 0;
+	sync_ctx.addr = addr;
+	sync_ctx.ndev = ndev;
+	sync_ctx.flush = 0;
+
+	ret = vlan_for_each(ndev, cpsw_update_vlan_uc, &sync_ctx);
+	if (sync_ctx.consumed < num && !ret)
+		ret = cpsw_set_uc(ndev, addr, -1, 1);
+
+	return ret;
+}
+
+static int cpsw_del_uc_addr(struct net_device *ndev, const u8 *addr, int num)
+{
+	struct addr_sync_ctx sync_ctx;
+
+	sync_ctx.consumed = 0;
+	sync_ctx.addr = addr;
+	sync_ctx.ndev = ndev;
+	sync_ctx.flush = 1;
+
+	vlan_for_each(ndev, cpsw_update_vlan_uc, &sync_ctx);
+	if (sync_ctx.consumed == num)
+		cpsw_set_uc(ndev, addr, -1, 0);
+
+	return 0;
+}
+
+static int cpsw_purge_vlan_uc(struct net_device *vdev, int vid, void *ctx)
+{
+	struct addr_sync_ctx *sync_ctx = ctx;
+	struct netdev_hw_addr *ha;
+	int found = 0;
+
+	if (!vdev || !(vdev->flags & IFF_UP))
+		return 0;
+
+	if (ether_addr_equal(vdev->dev_addr, sync_ctx->addr)) {
+		found = 1;
+	} else {
+		netdev_for_each_uc_addr(ha, vdev) {
+			if (ether_addr_equal(ha->addr, sync_ctx->addr)) {
+				found = ha->sync_cnt;
+				break;
+			}
+		}
+	}
+
+	if (found) {
+		sync_ctx->consumed++;
+		cpsw_set_uc(sync_ctx->ndev, sync_ctx->addr, vid, 0);
+	}
+
+	return 0;
+}
+
+static int cpsw_purge_all_uc(struct net_device *ndev, const u8 *addr, int num)
+{
+	struct addr_sync_ctx sync_ctx;
+
+	sync_ctx.addr = addr;
+	sync_ctx.ndev = ndev;
+	sync_ctx.consumed = 0;
+
+	vlan_for_each(ndev, cpsw_purge_vlan_uc, &sync_ctx);
+	if (sync_ctx.consumed < num)
+		cpsw_set_uc(ndev, addr, -1, 0);
+
+	return 0;
+}
+
 static void cpsw_ndo_set_rx_mode(struct net_device *ndev)
 {
 	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
@@ -816,6 +974,9 @@ static void cpsw_ndo_set_rx_mode(struct net_device *ndev)
 	/* add/remove mcast address either for real netdev or for vlan */
 	__hw_addr_ref_sync_dev(&ndev->mc, ndev, cpsw_add_mc_addr,
 			       cpsw_del_mc_addr);
+	/* sync ucast addresses for vlans and real netdev */
+	__hw_addr_ref_sync_dev(&ndev->uc, ndev, cpsw_add_uc_addr,
+			       cpsw_del_uc_addr);
 }
 
 static void cpsw_intr_enable(struct cpsw_common *cpsw)
@@ -2093,6 +2254,7 @@ static int cpsw_ndo_stop(struct net_device *ndev)
 
 	cpsw_info(priv, ifdown, "shutting down cpsw device\n");
 	__hw_addr_ref_unsync_dev(&ndev->mc, ndev, cpsw_purge_all_mc);
+	__hw_addr_ref_unsync_dev(&ndev->uc, ndev, cpsw_purge_all_uc);
 	netif_tx_stop_all_queues(priv->ndev);
 	netif_carrier_off(priv->ndev);
 
@@ -2374,6 +2536,21 @@ static void cpsw_ndo_tx_timeout(struct net_device *ndev)
 	netif_tx_wake_all_queues(ndev);
 }
 
+static int cpsw_inherit_vlan_address(struct net_device *vdev, int vid,
+				     void *arg)
+{
+	struct cpsw_priv *priv = arg;
+	struct cpsw_ale *ale;
+
+	if (!vdev || vdev->addr_assign_type != NET_ADDR_STOLEN)
+		return 0;
+
+	ale = priv->cpsw->ale;
+	cpsw_ale_del_ucast(ale, vdev->dev_addr, HOST_PORT_NUM, ALE_VLAN, vid);
+	cpsw_ale_add_ucast(ale, priv->mac_addr, HOST_PORT_NUM, ALE_VLAN, vid);
+	return 0;
+}
+
 static int cpsw_ndo_set_mac_address(struct net_device *ndev, void *p)
 {
 	struct cpsw_priv *priv = netdev_priv(ndev);
@@ -2404,6 +2581,10 @@ static int cpsw_ndo_set_mac_address(struct net_device *ndev, void *p)
 
 	memcpy(priv->mac_addr, addr->sa_data, ETH_ALEN);
 	memcpy(ndev->dev_addr, priv->mac_addr, ETH_ALEN);
+
+	/* update vlans inherited the device address */
+	vlan_for_each(ndev, cpsw_inherit_vlan_address, priv);
+
 	for_each_slave(priv, cpsw_set_slave_mac, priv);
 
 	pm_runtime_put(cpsw->dev);
@@ -3418,6 +3599,7 @@ static int cpsw_probe_dual_emac(struct cpsw_priv *priv)
 	priv_sl2->emac_port = 1;
 	cpsw->slaves[1].ndev = ndev;
 	ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_HW_VLAN_CTAG_RX;
+	ndev->priv_flags |= IFF_UNICAST_FLT;
 
 	ndev->netdev_ops = &cpsw_netdev_ops;
 	ndev->ethtool_ops = &cpsw_ethtool_ops;
@@ -3679,6 +3861,7 @@ static int cpsw_probe(struct platform_device *pdev)
 	}
 
 	ndev->features |= NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_HW_VLAN_CTAG_RX;
+	ndev->priv_flags |= IFF_UNICAST_FLT;
 
 	ndev->netdev_ops = &cpsw_netdev_ops;
 	ndev->ethtool_ops = &cpsw_ethtool_ops;
