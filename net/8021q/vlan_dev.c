@@ -335,25 +335,29 @@ static int vlan_dev_set_mac_address(struct net_device *dev, void *p)
 {
 	struct net_device *real_dev = vlan_dev_priv(dev)->real_dev;
 	struct sockaddr *addr = p;
+	u8 prev_addr[ETH_ALEN];
 	int err;
 
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
+	ether_addr_copy(prev_addr, dev->dev_addr);
+	ether_addr_copy(dev->dev_addr, addr->sa_data);
+
 	if (!(dev->flags & IFF_UP))
-		goto out;
+		return 0;
 
 	if (!ether_addr_equal(addr->sa_data, real_dev->dev_addr)) {
 		err = dev_uc_add(real_dev, addr->sa_data);
-		if (err < 0)
+		if (err < 0) {
+			ether_addr_copy(dev->dev_addr, prev_addr);
 			return err;
+		}
 	}
 
-	if (!ether_addr_equal(dev->dev_addr, real_dev->dev_addr))
-		dev_uc_del(real_dev, dev->dev_addr);
+	if (!ether_addr_equal(prev_addr, real_dev->dev_addr))
+		dev_uc_del(real_dev, prev_addr);
 
-out:
-	ether_addr_copy(dev->dev_addr, addr->sa_data);
 	return 0;
 }
 
