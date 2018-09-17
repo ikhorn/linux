@@ -16,6 +16,41 @@
 #include <linux/export.h>
 #include <linux/list.h>
 
+
+static struct vid_entry *vid_add(struct netdev_hw_addr *ha, unsigned int vid)
+{
+	struct vid_entry *ve;
+
+	ve = kmalloc(sizeof(vid_entry), GFP_ATOMIC);
+	if (!ve)
+		return NULL;
+
+	ve->vid = vid;
+	ha->vid_update = 1;
+	list_add_tail_rcu(&ve->list, &ha->vid_list);
+
+	return ve;
+}
+
+static int vid_del(struct netdev_hw_addr *ha, unsigned int vid)
+{
+	struct vid_entry *ve;
+
+	list_for_each_entry(ve, &ha->vid_list, list) {
+		if (vid != ve->vid)
+			continue;
+
+		if (--ve->refcount)
+			return 0;
+
+		list_del_rcu(&ve->list);
+		kfree_rcu(ve, rcu_head);
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
 /*
  * General list handling functions
  */
@@ -23,9 +58,10 @@
 static int __hw_addr_create_ex(struct netdev_hw_addr_list *list,
 			       const unsigned char *addr, int addr_len,
 			       unsigned char addr_type, bool global,
-			       bool sync)
+			       bool sync, unsigned int vid)
 {
 	struct netdev_hw_addr *ha;
+	struct vid_entry *ve;
 	int alloc_size;
 
 	alloc_size = sizeof(*ha);
@@ -34,6 +70,14 @@ static int __hw_addr_create_ex(struct netdev_hw_addr_list *list,
 	ha = kmalloc(alloc_size, GFP_ATOMIC);
 	if (!ha)
 		return -ENOMEM;
+
+	INIT_LIST_HEAD(&ha->vid_list);
+
+	/* add default vid */
+	ve = vid_add(ha, vid);
+	if (!ve)
+		return -ENOMEM;
+
 	memcpy(ha->addr, addr, addr_len);
 	ha->type = addr_type;
 	ha->refcount = 1;
@@ -49,9 +93,10 @@ static int __hw_addr_create_ex(struct netdev_hw_addr_list *list,
 static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 			    const unsigned char *addr, int addr_len,
 			    unsigned char addr_type, bool global, bool sync,
-			    int sync_count)
+			    int sync_count, unsigned int vid)
 {
 	struct netdev_hw_addr *ha;
+	struct vid_entry *ve;
 
 	if (addr_len > MAX_ADDR_LEN)
 		return -EINVAL;
@@ -59,6 +104,7 @@ static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 	list_for_each_entry(ha, &list->list, list) {
 		if (ha->type == addr_type &&
 		    !memcmp(ha->addr, addr, addr_len)) {
+
 			if (global) {
 				/* check if addr is already used as global */
 				if (ha->global_use)
@@ -73,25 +119,34 @@ static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 					ha->synced++;
 			}
 			ha->refcount++;
+
+			list_for_each_entry(ve, &ha->vid_list, list)
+				if (vid == ve->vid)
+					return 0;
+
+			ve = vid_add(ha, vid);
+			if (!ve)
+				return -ENOMEM;
+
 			return 0;
 		}
 	}
 
 	return __hw_addr_create_ex(list, addr, addr_len, addr_type, global,
-				   sync);
+				   sync, vid);
 }
 
 static int __hw_addr_add(struct netdev_hw_addr_list *list,
 			 const unsigned char *addr, int addr_len,
-			 unsigned char addr_type)
+			 unsigned char addr_type, unsigned int vid)
 {
 	return __hw_addr_add_ex(list, addr, addr_len, addr_type, false, false,
-				0);
+				0, vid);
 }
 
 static int __hw_addr_del_entry(struct netdev_hw_addr_list *list,
 			       struct netdev_hw_addr *ha, bool global,
-			       bool sync)
+			       bool sync, unsigned int vid)
 {
 	if (global && !ha->global_use)
 		return -ENOENT;
@@ -105,6 +160,8 @@ static int __hw_addr_del_entry(struct netdev_hw_addr_list *list,
 	if (sync)
 		ha->synced--;
 
+	vid_del(ha, vid);
+
 	if (--ha->refcount)
 		return 0;
 	list_del_rcu(&ha->list);
@@ -115,35 +172,39 @@ static int __hw_addr_del_entry(struct netdev_hw_addr_list *list,
 
 static int __hw_addr_del_ex(struct netdev_hw_addr_list *list,
 			    const unsigned char *addr, int addr_len,
-			    unsigned char addr_type, bool global, bool sync)
+			    unsigned char addr_type, bool global, bool sync,
+			    unsigned int vid)
 {
 	struct netdev_hw_addr *ha;
 
 	list_for_each_entry(ha, &list->list, list) {
 		if (!memcmp(ha->addr, addr, addr_len) &&
 		    (ha->type == addr_type || !addr_type))
-			return __hw_addr_del_entry(list, ha, global, sync);
+			return __hw_addr_del_entry(list, ha, global, sync, vid);
 	}
 	return -ENOENT;
 }
 
 static int __hw_addr_del(struct netdev_hw_addr_list *list,
 			 const unsigned char *addr, int addr_len,
-			 unsigned char addr_type)
+			 unsigned char addr_type, unsigned int vid)
 {
-	return __hw_addr_del_ex(list, addr, addr_len, addr_type, false, false);
+	return __hw_addr_del_ex(list, addr, addr_len, addr_type, false, false,
+				vid);
 }
 
 static int __hw_addr_sync_one(struct netdev_hw_addr_list *to_list,
-			       struct netdev_hw_addr *ha,
-			       int addr_len)
+			      struct netdev_hw_addr *ha, int addr_len)
 {
+	struct vid_entry *ve;
 	int err;
 
-	err = __hw_addr_add_ex(to_list, ha->addr, addr_len, ha->type,
-			       false, true, ha->sync_cnt);
-	if (err && err != -EEXIST)
-		return err;
+	list_for_each_entry(ve, &ha->vid_list, list) {
+		err = __hw_addr_add_ex(to_list, ha->addr, addr_len, ha->type,
+				       false, true, ha->sync_cnt, ve->vid);
+		if (err && err != -EEXIST)
+			return err;
+	}
 
 	if (!err) {
 		ha->sync_cnt++;
@@ -155,18 +216,20 @@ static int __hw_addr_sync_one(struct netdev_hw_addr_list *to_list,
 
 static void __hw_addr_unsync_one(struct netdev_hw_addr_list *to_list,
 				 struct netdev_hw_addr_list *from_list,
-				 struct netdev_hw_addr *ha,
-				 int addr_len)
+				 struct netdev_hw_addr *ha, int addr_len)
 {
+	struct vid_entry *ve;
 	int err;
 
-	err = __hw_addr_del_ex(to_list, ha->addr, addr_len, ha->type,
-			       false, true);
-	if (err)
-		return;
-	ha->sync_cnt--;
-	/* address on from list is not marked synced */
-	__hw_addr_del_entry(from_list, ha, false, false);
+	list_for_each_entry(ve, &ha->vid_list, list) {
+		err = __hw_addr_del_ex(to_list, ha->addr, addr_len, ha->type,
+				       false, true, ve->vid);
+		if (err)
+			return;
+		ha->sync_cnt--;
+		/* address on from list is not marked synced */
+		__hw_addr_del_entry(from_list, ha, false, false, ve->vid);
+	}
 }
 
 static int __hw_addr_sync_multiple(struct netdev_hw_addr_list *to_list,
@@ -205,8 +268,12 @@ int __hw_addr_sync(struct netdev_hw_addr_list *to_list,
 			err = __hw_addr_sync_one(to_list, ha, addr_len);
 			if (err)
 				break;
-		} else if (ha->refcount == 1)
+		} else if (ha->refcount == 1) {
 			__hw_addr_unsync_one(to_list, from_list, ha, addr_len);
+		} else if (ha->vid_update)
+			vid_sync(hafrom, hato);
+			return;
+		}
 	}
 	return err;
 }
@@ -257,7 +324,7 @@ int __hw_addr_sync_dev(struct netdev_hw_addr_list *list,
 			continue;
 
 		ha->sync_cnt--;
-		__hw_addr_del_entry(list, ha, false, false);
+		__hw_addr_del_entry(list, ha, false, false, -1);
 	}
 
 	/* go through and sync new entries to the list */
@@ -316,7 +383,7 @@ int __hw_addr_ref_sync_dev(struct netdev_hw_addr_list *list,
 
 		ha->refcount = (ref_cnt << 1) + 1;
 		ha->sync_cnt = ref_cnt;
-		__hw_addr_del_entry(list, ha, false, false);
+		__hw_addr_del_entry(list, ha, false, false, -1);
 	}
 
 	/* go through and sync updated/new entries to the list */
@@ -369,7 +436,7 @@ void __hw_addr_ref_unsync_dev(struct netdev_hw_addr_list *list,
 
 		ha->refcount -= ha->sync_cnt - 1;
 		ha->sync_cnt = 0;
-		__hw_addr_del_entry(list, ha, false, false);
+		__hw_addr_del_entry(list, ha, false, false, -1);
 	}
 }
 EXPORT_SYMBOL(__hw_addr_ref_unsync_dev);
@@ -402,7 +469,7 @@ void __hw_addr_unsync_dev(struct netdev_hw_addr_list *list,
 			continue;
 
 		ha->sync_cnt--;
-		__hw_addr_del_entry(list, ha, false, false);
+		__hw_addr_del_entry(list, ha, false, false, -1);
 	}
 }
 EXPORT_SYMBOL(__hw_addr_unsync_dev);
@@ -466,7 +533,7 @@ int dev_addr_init(struct net_device *dev)
 	__hw_addr_init(&dev->dev_addrs);
 	memset(addr, 0, sizeof(addr));
 	err = __hw_addr_add(&dev->dev_addrs, addr, sizeof(addr),
-			    NETDEV_HW_ADDR_T_LAN);
+			    NETDEV_HW_ADDR_T_LAN, 0);
 	if (!err) {
 		/*
 		 * Get the first (previously created) address from the list
@@ -498,7 +565,7 @@ int dev_addr_add(struct net_device *dev, const unsigned char *addr,
 
 	ASSERT_RTNL();
 
-	err = __hw_addr_add(&dev->dev_addrs, addr, dev->addr_len, addr_type);
+	err = __hw_addr_add(&dev->dev_addrs, addr, dev->addr_len, addr_type, 0);
 	if (!err)
 		call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
 	return err;
@@ -535,7 +602,7 @@ int dev_addr_del(struct net_device *dev, const unsigned char *addr,
 		return -ENOENT;
 
 	err = __hw_addr_del(&dev->dev_addrs, addr, dev->addr_len,
-			    addr_type);
+			    addr_type, 0);
 	if (!err)
 		call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
 	return err;
@@ -582,7 +649,8 @@ EXPORT_SYMBOL(dev_uc_add_excl);
  *	Add a secondary unicast address to the device or increase
  *	the reference count if it already exists.
  */
-int dev_uc_add(struct net_device *dev, const unsigned char *addr)
+int dev_uc_add(struct net_device *dev, const unsigned char *addr,
+	       unsigned int vid)
 {
 	int err;
 
@@ -604,13 +672,14 @@ EXPORT_SYMBOL(dev_uc_add);
  *	Release reference to a secondary unicast address and remove it
  *	from the device if the reference count drops to zero.
  */
-int dev_uc_del(struct net_device *dev, const unsigned char *addr)
+int dev_uc_del(struct net_device *dev, const unsigned char *addr,
+	       unsigned int vid)
 {
 	int err;
 
 	netif_addr_lock_bh(dev);
 	err = __hw_addr_del(&dev->uc, addr, dev->addr_len,
-			    NETDEV_HW_ADDR_T_UNICAST);
+			    NETDEV_HW_ADDR_T_UNICAST, vid);
 	if (!err)
 		__dev_set_rx_mode(dev);
 	netif_addr_unlock_bh(dev);
@@ -759,13 +828,14 @@ out:
 EXPORT_SYMBOL(dev_mc_add_excl);
 
 static int __dev_mc_add(struct net_device *dev, const unsigned char *addr,
-			bool global)
+			bool global, unsigned int vid)
 {
 	int err;
 
 	netif_addr_lock_bh(dev);
 	err = __hw_addr_add_ex(&dev->mc, addr, dev->addr_len,
-			       NETDEV_HW_ADDR_T_MULTICAST, global, false, 0);
+			       NETDEV_HW_ADDR_T_MULTICAST, global, false, 0,
+			       vid);
 	if (!err)
 		__dev_set_rx_mode(dev);
 	netif_addr_unlock_bh(dev);
@@ -799,13 +869,13 @@ int dev_mc_add_global(struct net_device *dev, const unsigned char *addr)
 EXPORT_SYMBOL(dev_mc_add_global);
 
 static int __dev_mc_del(struct net_device *dev, const unsigned char *addr,
-			bool global)
+			bool global, unsigned int vid)
 {
 	int err;
 
 	netif_addr_lock_bh(dev);
 	err = __hw_addr_del_ex(&dev->mc, addr, dev->addr_len,
-			       NETDEV_HW_ADDR_T_MULTICAST, global, false);
+			       NETDEV_HW_ADDR_T_MULTICAST, global, false, vid);
 	if (!err)
 		__dev_set_rx_mode(dev);
 	netif_addr_unlock_bh(dev);
