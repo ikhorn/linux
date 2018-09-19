@@ -76,6 +76,8 @@ void netdev_set_default_ethtool_ops(struct net_device *dev,
 #define NET_RX_SUCCESS		0	/* keep 'em coming, baby */
 #define NET_RX_DROP		1	/* packet dropped */
 
+#define NET_802Q_VID_TSIZE	2
+
 /*
  * Transmit return codes: transmit return codes originate from three different
  * namespaces:
