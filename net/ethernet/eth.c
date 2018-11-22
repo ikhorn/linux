@@ -364,6 +364,7 @@ void ether_setup(struct net_device *dev)
 	dev->min_mtu		= ETH_MIN_MTU;
 	dev->max_mtu		= ETH_DATA_LEN;
 	dev->addr_len		= ETH_ALEN;
+	dev->vid_len		= NET_802Q_VID_TSIZE;
 	dev->tx_queue_len	= DEFAULT_TX_QUEUE_LEN;
 	dev->flags		= IFF_BROADCAST|IFF_MULTICAST;
 	dev->priv_flags		|= IFF_TX_SKB_SHARING;
@@ -391,8 +392,18 @@ EXPORT_SYMBOL(ether_setup);
 struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs,
 				      unsigned int rxqs)
 {
-	return alloc_netdev_mqs(sizeof_priv, "eth%d", NET_NAME_UNKNOWN,
-				ether_setup, txqs, rxqs);
+	struct net_device *dev;
+
+	dev = alloc_netdev_mqs(sizeof_priv, "eth%d", NET_NAME_UNKNOWN,
+			       ether_setup, txqs, rxqs);
+
+	/* TODO: When number of real ehternet devices supporting vlan
+	 * addressing scheme becomes more than simple ones, it should
+	 * be removed, disabling it (by dev->vid_len = 0) for those
+	 * who doesn't support it
+	 */
+	dev->vid_len = 0;
+	return dev;
 }
 EXPORT_SYMBOL(alloc_etherdev_mqs);
 
